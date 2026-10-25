@@ -1,0 +1,5 @@
+# Exclude the treebank dataset
+ud-treebanks-v2.18/
+
+# Exclude the compiled executable
+/closeness_significance
