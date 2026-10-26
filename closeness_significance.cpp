@@ -3,7 +3,6 @@
 #include <vector>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <algorithm>
 #include <random>
 #include <cmath>
@@ -15,7 +14,6 @@
 
 using namespace std;
 
-// Undirected graph structure storing both adjacency list and edge list
 struct Graph {
     int N = 0;
     int E = 0;
@@ -23,13 +21,69 @@ struct Graph {
     vector<pair<int, int>> edges;
 };
 
-// Pack an undirected vertex pair (u, v) into a 64-bit integer key for O(1) edge lookup
 inline uint64_t edge_key(int u, int v) {
     if (u > v) swap(u, v);
     return (static_cast<uint64_t>(u) << 32) | static_cast<uint32_t>(v);
 }
 
-// Load network from data/<language>_dependency_network.txt
+// Fast open-addressing hash set for O(1) zero-allocation edge lookups and swaps
+struct FlatEdgeSet {
+    static constexpr uint64_t EMPTY = ~0ULL;
+    vector<uint64_t> table;
+    size_t mask = 0;
+
+    void init(size_t num_edges) {
+        size_t cap = 1;
+        while (cap < num_edges * 4) cap <<= 1;
+        table.assign(cap, EMPTY);
+        mask = cap - 1;
+    }
+
+    inline size_t hash_key(uint64_t k) const {
+        k ^= k >> 33;
+        k *= 0xff51afd7ed558ccdULL;
+        k ^= k >> 33;
+        return static_cast<size_t>(k) & mask;
+    }
+
+    inline bool contains(uint64_t k) const {
+        size_t idx = hash_key(k);
+        while (table[idx] != EMPTY) {
+            if (table[idx] == k) return true;
+            idx = (idx + 1) & mask;
+        }
+        return false;
+    }
+
+    inline bool insert(uint64_t k) {
+        size_t idx = hash_key(k);
+        while (table[idx] != EMPTY) {
+            if (table[idx] == k) return false;
+            idx = (idx + 1) & mask;
+        }
+        table[idx] = k;
+        return true;
+    }
+
+    inline void erase(uint64_t k) {
+        size_t idx = hash_key(k);
+        while (table[idx] != k) {
+            idx = (idx + 1) & mask;
+        }
+        size_t next = (idx + 1) & mask;
+        while (table[next] != EMPTY) {
+            size_t ideal = hash_key(table[next]);
+            if ((next > idx && (ideal <= idx || ideal > next)) ||
+                (next < idx && (ideal <= idx && ideal > next))) {
+                table[idx] = table[next];
+                idx = next;
+            }
+            next = (next + 1) & mask;
+        }
+        table[idx] = EMPTY;
+    }
+};
+
 Graph load_network(const string& filename) {
     ifstream in(filename);
     if (!in.is_open()) {
@@ -64,15 +118,14 @@ Graph load_network(const string& filename) {
     return g;
 }
 
-// Compute local closeness C_i for a single vertex using BFS
 double compute_single_closeness(const Graph& g, int src, vector<int>& dist, vector<int>& q) {
     int k_src = g.adj[src].size();
     if (k_src == 0) return 0.0;
 
-    // Degree-1 shortcut: deduce distances from the unique neighbor's BFS
+    // Degree-1 shortcut: infer distances from the unique neighbor's BFS
     int bfs_root = (k_src == 1) ? g.adj[src][0] : src;
     if (k_src == 1 && g.adj[bfs_root].size() == 1) {
-        return 1.0 / (g.N - 1); // Isolated dyad
+        return 1.0 / (g.N - 1);
     }
 
     int head = 0, tail = 0;
@@ -84,8 +137,7 @@ double compute_single_closeness(const Graph& g, int src, vector<int>& dist, vect
 
     while (head < tail) {
         int u = q[head++];
-        int d = dist[u];
-        int next_d = d + 1;
+        int next_d = dist[u] + 1;
         for (int v : g.adj[u]) {
             if (dist[v] == -1) {
                 dist[v] = next_d;
@@ -97,7 +149,6 @@ double compute_single_closeness(const Graph& g, int src, vector<int>& dist, vect
         }
     }
 
-    // Reset visited distances for next call
     for (int i = 0; i < tail; ++i) dist[q[i]] = -1;
 
     double sum_inv = 0.0;
@@ -114,8 +165,6 @@ double compute_single_closeness(const Graph& g, int src, vector<int>& dist, vect
     return sum_inv / (g.N - 1);
 }
 
-// Compute exact or sampled closeness centrality of the real graph
-// If sample_Order is passed, uses the exact same M vertices for fair variance reduction
 double compute_closeness(const Graph& g, const vector<int>& eval_nodes) {
     int M = eval_nodes.size();
     double total_c = 0.0;
@@ -124,7 +173,7 @@ double compute_closeness(const Graph& g, const vector<int>& eval_nodes) {
     {
         vector<int> dist(g.N, -1);
         vector<int> q(g.N);
-        #pragma omp for schedule(dynamic, 32)
+        #pragma omp for schedule(dynamic, 16)
         for (int idx = 0; idx < M; ++idx) {
             total_c += compute_single_closeness(g, eval_nodes[idx], dist, q);
         }
@@ -132,28 +181,22 @@ double compute_closeness(const Graph& g, const vector<int>& eval_nodes) {
     return total_c / M;
 }
 
-// Evaluate whether C_NH >= C_target using tight 2-hop upper bounds and early stopping
 bool is_null_closeness_geq(const Graph& g, double c_target, const vector<int>& sample_nodes,
                            bool use_exact_all, int& nodes_evaluated_out) {
     int N = g.N;
     if (!use_exact_all) {
-        // Sampled mode (Section 3.2) with Section 5 2-hop upper-bound early stopping
         int M = sample_nodes.size();
         vector<int> order = sample_nodes;
         sort(order.begin(), order.end(), [&](int a, int b) {
             return g.adj[a].size() > g.adj[b].size();
         });
 
-        // Precompute tight 2-hop upper bound u_i for the M sampled nodes
         vector<double> u_bound(M, 0.0);
         double sum_upper_rem = 0.0;
         for (int idx = 0; idx < M; ++idx) {
             int u = order[idx];
             long long k1 = g.adj[u].size();
-            if (k1 == 0) {
-                u_bound[idx] = 0.0;
-                continue;
-            }
+            if (k1 == 0) continue;
             long long k2_max = 0;
             for (int v : g.adj[u]) k2_max += (long long)g.adj[v].size() - 1;
             long long rem1 = (N - 1) - k1;
@@ -166,21 +209,17 @@ bool is_null_closeness_geq(const Graph& g, double c_target, const vector<int>& s
         double sum_exact = 0.0;
         double target_sum = c_target * M;
         int evaluated = 0;
-        bool decided = false;
-        bool result = false;
-
-        // Evaluate in parallel batches to check early stopping conditions
+        bool decided = false, result = false;
         int batch_size = 64;
+
         for (int start = 0; start < M && !decided; start += batch_size) {
             int end = min(M, start + batch_size);
-            double batch_exact = 0.0;
-            double batch_upper = 0.0;
+            double batch_exact = 0.0, batch_upper = 0.0;
 
             #pragma omp parallel reduction(+:batch_exact, batch_upper)
             {
-                vector<int> dist(N, -1);
-                vector<int> q(N);
-                #pragma omp for schedule(static)
+                vector<int> dist(N, -1), q(N);
+                #pragma omp for schedule(dynamic, 4)
                 for (int idx = start; idx < end; ++idx) {
                     batch_exact += compute_single_closeness(g, order[idx], dist, q);
                     batch_upper += u_bound[idx];
@@ -203,7 +242,7 @@ bool is_null_closeness_geq(const Graph& g, double c_target, const vector<int>& s
         return result;
     }
 
-    // Full Exact Mode (M = N) with k=0, k=1 leaf deduction and 2-hop bounds
+    // Exact Mode (M = N) with parent-to-leaf k=1 deduction and 2-hop upper bounds
     vector<int> comp_id(N, -1), comp_size, q_bfs(N);
     for (int i = 0; i < N; ++i) {
         if (comp_id[i] == -1) {
@@ -227,8 +266,7 @@ bool is_null_closeness_geq(const Graph& g, double c_target, const vector<int>& s
     vector<double> u_bound(N, 0.0);
     vector<char> resolved(N, 0);
     vector<vector<int>> leaves_of(N);
-    double sum_exact = 0.0;
-    double sum_upper_rem = 0.0;
+    double sum_exact = 0.0, sum_upper_rem = 0.0;
 
     for (int i = 0; i < N; ++i) {
         long long k1 = g.adj[i].size();
@@ -264,20 +302,17 @@ bool is_null_closeness_geq(const Graph& g, double c_target, const vector<int>& s
     });
 
     double target_sum = c_target * N;
-    int H = hubs.size();
-    int evaluated = 0;
+    int H = hubs.size(), evaluated = 0;
     bool decided = false, result = false;
     int batch_size = 64;
 
     for (int start = 0; start < H && !decided; start += batch_size) {
         int end = min(H, start + batch_size);
-        double batch_exact = 0.0;
-        double batch_upper = 0.0;
+        double batch_exact = 0.0, batch_upper = 0.0;
 
         #pragma omp parallel reduction(+:batch_exact, batch_upper)
         {
-            vector<int> dist(N, -1), q(N);
-            vector<int> dist_freq(64, 0);
+            vector<int> dist(N, -1), q(N), dist_freq(64, 0);
             #pragma omp for schedule(dynamic, 4)
             for (int idx = start; idx < end; ++idx) {
                 int root = hubs[idx];
@@ -335,7 +370,6 @@ bool is_null_closeness_geq(const Graph& g, double c_target, const vector<int>& s
     return result;
 }
 
-// Generate an Erdos-Renyi random graph G(N, E) without loops or multiedges
 Graph generate_erdos_renyi(int N, int E, mt19937_64& rng) {
     Graph g;
     g.N = N;
@@ -343,8 +377,8 @@ Graph generate_erdos_renyi(int N, int E, mt19937_64& rng) {
     g.adj.resize(N);
     g.edges.reserve(E);
 
-    unordered_set<uint64_t> existing;
-    existing.reserve(E * 2);
+    FlatEdgeSet existing;
+    existing.init(E);
     uniform_int_distribution<int> dist(0, N - 1);
 
     while ((int)g.edges.size() < E) {
@@ -352,7 +386,7 @@ Graph generate_erdos_renyi(int N, int E, mt19937_64& rng) {
         int v = dist(rng);
         if (u == v) continue;
         uint64_t key = edge_key(u, v);
-        if (existing.insert(key).second) {
+        if (existing.insert(key)) {
             g.adj[u].push_back(v);
             g.adj[v].push_back(u);
             g.edges.push_back({u, v});
@@ -361,7 +395,6 @@ Graph generate_erdos_renyi(int N, int E, mt19937_64& rng) {
     return g;
 }
 
-// Generate a degree-preserving randomized graph via the Switching Model (Q * E trials)
 Graph generate_switching_graph(const Graph& orig, int Q, mt19937_64& rng) {
     Graph g;
     g.N = orig.N;
@@ -369,8 +402,8 @@ Graph generate_switching_graph(const Graph& orig, int Q, mt19937_64& rng) {
     g.edges = orig.edges;
 
     int E = g.E;
-    unordered_set<uint64_t> existing;
-    existing.reserve(E * 2);
+    FlatEdgeSet existing;
+    existing.init(E);
     for (const auto& e : g.edges) {
         existing.insert(edge_key(e.first, e.second));
     }
@@ -381,25 +414,21 @@ Graph generate_switching_graph(const Graph& orig, int Q, mt19937_64& rng) {
     for (long long t = 0; t < total_trials; ++t) {
         int idx1 = edge_dist(rng);
         int idx2 = edge_dist(rng);
-        if (idx1 == idx2) continue; // Coincident edges (Case 1)
+        if (idx1 == idx2) continue;
 
         int u = g.edges[idx1].first;
         int v = g.edges[idx1].second;
         int s = g.edges[idx2].first;
         int w = g.edges[idx2].second;
 
-        // Randomly orient the second edge to allow both degree-preserving swaps equally
         if (t & 1) swap(s, w);
 
-        // Check for coincident vertices (Case 2: prevents self-loops and trivial swaps)
         if (u == s || u == w || v == s || v == w) continue;
 
-        // Check for multiedges (Case 3)
         uint64_t new_k1 = edge_key(u, s);
         uint64_t new_k2 = edge_key(v, w);
-        if (existing.count(new_k1) || existing.count(new_k2)) continue;
+        if (existing.contains(new_k1) || existing.contains(new_k2)) continue;
 
-        // Perform valid switch
         existing.erase(edge_key(u, v));
         existing.erase(edge_key(s, w));
         existing.insert(new_k1);
@@ -409,7 +438,6 @@ Graph generate_switching_graph(const Graph& orig, int Q, mt19937_64& rng) {
         g.edges[idx2] = {v, w};
     }
 
-    // Rebuild adjacency list once after all Q*E switching trials finish
     g.adj.assign(g.N, vector<int>());
     for (int i = 0; i < g.N; ++i) g.adj[i].reserve(orig.adj[i].size());
     for (const auto& e : g.edges) {
@@ -422,7 +450,7 @@ Graph generate_switching_graph(const Graph& orig, int Q, mt19937_64& rng) {
 int main(int argc, char* argv[]) {
     int T = (argc > 1) ? stoi(argv[1]) : 25;
     int Q = (argc > 2) ? stoi(argv[2]) : 10;
-    double sample_ratio = (argc > 3) ? stod(argv[3]) : 0.05; // Default 5% sampling (or 1.0 for exact)
+    double sample_ratio = (argc > 3) ? stod(argv[3]) : 0.05;
     string single_lang = (argc > 4) ? argv[4] : "ALL";
 
     vector<string> languages = {
@@ -453,10 +481,13 @@ int main(int argc, char* argv[]) {
         Graph g = load_network(path);
 
         bool use_exact = (sample_ratio >= 0.999);
-        int M = use_exact ? g.N : max(500, min(g.N, (int)round(g.N * sample_ratio)));
-        if (M == g.N) use_exact = true;
+        int M = g.N;
+        if (!use_exact) {
+            int raw_M = (int)round(g.N * sample_ratio);
+            M = min(g.N, max(1000, min(2500, raw_M)));
+            if (M == g.N) use_exact = true;
+        }
 
-        // Uniform random permutation of vertices for Section 3.2 sampling
         vector<int> perm(g.N);
         for (int i = 0; i < g.N; ++i) perm[i] = i;
         if (!use_exact) {
