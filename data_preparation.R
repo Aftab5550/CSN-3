@@ -33,8 +33,8 @@ build_undirected_network <- function(treebanks_path, language_name) {
   edges_data <- merge(all_rows, head_lookup, by = c("sentence_uid", "head_token_id"))
   
   # Normalize words to lowercase and replace internal spaces in multi-part tokens
-  from_words <- gsub("\\s+", "_", tolower(trimws(edges_data$head_token)))
-  to_words   <- gsub("\\s+", "_", tolower(trimws(edges_data$token)))
+  from_words <- gsub("[[:punct:]]", "", gsub("\\s+", "_", tolower(trimws(edges_data$head_token))))
+  to_words   <- gsub("[[:punct:]]", "", gsub("\\s+", "_", tolower(trimws(edges_data$token))))
   
   # Filter out missing words (_) and self-loops (u == v)
   valid <- from_words != "_" & to_words != "_" &
