@@ -1,7 +1,6 @@
 // bounds.cpp — analytical p-value bounds for mean closeness under G(N,E)
+// Includes: Markov, higher-moment Markov, Cantelli, path-count Markov, path Chebyshev.
 // Compile:  g++ -O3 -march=native -fopenmp -std=c++17 bounds.cpp -o bounds
-// Usage:    ./bounds [--data DIR] [--x-file CSV] [--orders 1,2,3,4]
-//                    [--out CSV] [--detail CSV] [--threads 16]
 
 #include <iostream>
 #include <fstream>
@@ -29,7 +28,7 @@ namespace fs = std::filesystem;
 
 struct Network {
     int N = 0;
-    vector<pair<int,int>> edges;   // normalised (u < v)
+    vector<pair<int,int>> edges;
     vector<vector<int>>   adj;
 };
 
@@ -45,13 +44,12 @@ struct Bound {
 struct BoundResult {
     double best;
     double U_X, U_Z, L_Z, deterministic_max;
-    vector<double> moments_Z;      // indexed by order 0..max_order
+    vector<double> moments_Z;
     vector<Bound>  bounds;
 };
 
 // ============================================================
-// Read a network (edge-list OR adjacency-list, int OR string labels)
-// Faithful port of Python's read_network.
+// Network I/O
 // ============================================================
 
 Network read_network(const string& path) {
@@ -70,7 +68,6 @@ Network read_network(const string& path) {
         if (h >> tok) { try { N_header = stoi(tok); } catch (...) {} }
     }
 
-    // detect int vs string tokens
     bool all_int = true;
     for (size_t i = 1; i < lines.size() && all_int; ++i) {
         istringstream iss(lines[i]);
@@ -128,8 +125,7 @@ Network read_network(const string& path) {
 }
 
 // ============================================================
-// Exact mean closeness, parallel over sources.
-//   C = (1 / (N(N-1))) * sum_{i != j} 1/d_ij
+// Exact mean closeness (parallel over sources)
 // ============================================================
 
 double observed_closeness(const Network& g, int num_threads) {
@@ -145,31 +141,26 @@ double observed_closeness(const Network& g, int num_threads) {
         #pragma omp for schedule(dynamic, 16)
         for (int src = 0; src < N; ++src) {
             if (g.adj[src].empty()) continue;
-
             int head = 0, tail = 0;
             q[tail++] = src;
             dist[src] = 0;
-
             while (head < tail) {
                 int u = q[head++];
                 int nd = dist[u] + 1;
                 for (int v : g.adj[u])
                     if (dist[v] == -1) { dist[v] = nd; q[tail++] = v; }
             }
-
             double s = 0.0;
             for (int i = 1; i < tail; ++i) s += 1.0 / dist[q[i]];
             total += s;
-
             for (int i = 0; i < tail; ++i) dist[q[i]] = -1;
         }
     }
-
     return total / ((double)N * (N - 1));
 }
 
 // ============================================================
-// Original first-moment bound + Markov
+// Old first-moment bound + Markov
 // ============================================================
 
 double closeness_upper_original(int N, int E) {
@@ -200,8 +191,7 @@ double markov(double U, double x) {
 }
 
 // ============================================================
-// S_r = sum_l  (l^{-r} - (l+1)^{-r}) * alpha_l    (last term l=N-1: l^{-r} * alpha)
-// returns S[1..max_order]; delta, max_alpha out-parameters.
+// Non-edge moment bounds (existing)
 // ============================================================
 
 vector<double> nonedge_S(int N, int E, int max_order,
@@ -230,7 +220,6 @@ vector<double> nonedge_S(int N, int E, int max_order,
         if (alpha < max_alpha)
             alpha = isfinite(eta) ? min(max_alpha, alpha + eta) : max_alpha;
 
-        // iterative inverse powers:  lf^{-s}, nf^{-s} for s = 1..max_order
         const double lf = (double)l;
         const double nf = lf + 1.0;
         const double inv_lf = 1.0 / lf, inv_nf = 1.0 / nf;
@@ -268,10 +257,6 @@ vector<double> nonedge_S(int N, int E, int max_order,
     return S;
 }
 
-// ============================================================
-// Paley-Zygmund lower bound on Y = X - delta
-// ============================================================
-
 double lower_nonedge_Y(int N, int E) {
     long long M = (long long)N * (N - 1) / 2;
     if (M == 0) return 0.0;
@@ -298,6 +283,176 @@ double lower_nonedge_Y(int N, int E) {
 
     double pz = min(1.0, EY * EY / EY2);
     return min(c, 0.5 * pz);
+}
+
+// ============================================================
+// expected number of simple paths of length l in G(N,E)
+//   E[P_l] = (N)_{l+1}/2 * (E)_l/(M)_l
+// ============================================================
+
+static double expected_paths(int N, int E, int l) {
+    if (l < 1) return 0.0;
+    if (l > N - 1) return 0.0;   // no simple path that long
+    if (l == 1) return (double)E;
+    if (l > E) return 0.0;
+
+    long long M = (long long)N * (N - 1) / 2;
+    double lg = -std::log(2.0);
+    for (int i = 0; i <= l; ++i) lg += std::log((double)(N - i));
+    for (int i = 0; i < l; ++i) {
+        if (E - i <= 0) return 0.0;
+        lg += std::log((double)(E - i)) - std::log((double)(M - i));
+    }
+    return std::exp(lg);
+}
+
+// ============================================================
+// upper bound on Var(P_l)
+//
+//   Var(P_l) <= n_l * \Sigma_t q_{2l-t} · \Sigma_c C(t-1,c-1)*C(l-t+1,c)
+//                                * (N-t-c)_f * C(c+f,c) * c! * 2^c / 2
+//   f = l + 1 - t - c >= 0,  n_l = (N)_{l+1}/2,  q_m = (E)_m/(M)_m
+// ============================================================
+
+static double path_variance_bound(int N, int E, int l) {
+    if (l < 2) return 0.0;
+    long long Mll = (long long)N * (N - 1) / 2;
+    if (Mll <= 0) return 0.0;
+    double M = (double)Mll;
+
+    // n_l = (N)_{l+1}/2
+    double n_l = 0.5;
+    for (int i = 0; i <= l; ++i) {
+        n_l *= (double)(N - i);
+        if (!std::isfinite(n_l) || n_l == 0.0) return 0.0;
+    }
+
+    // log q_m for q_m = (E)_m/(M)_m
+    auto log_q = [&](int m) -> double {
+        if (m < 0 || m > E || (double)m > M) return -std::numeric_limits<double>::infinity();
+        double lg = 0.0;
+        for (int i = 0; i < m; ++i)
+            lg += std::log((double)(E - i)) - std::log((double)(M - i));
+        return lg;
+    };
+
+    double var = 0.0;
+    for (int t = 1; t <= l; ++t) {
+        int u = 2 * l - t;
+        double lgq = log_q(u);
+        if (!std::isfinite(lgq)) continue;
+        double q_val = std::exp(lgq);
+        if (q_val == 0.0) continue;
+
+        double sum_c = 0.0;
+        for (int c = 1; c <= std::min(t, l - t + 1); ++c) {
+            int f = l + 1 - t - c;
+            if (f < 0) continue;
+            if (N - t - c < f) continue;
+
+            // C(t-1, c-1)
+            double b1 = 1.0;
+            for (int i = 0; i < c - 1; ++i)
+                b1 *= (double)(t - 1 - i) / (i + 1);
+
+            // C(l-t+1, c)
+            double b2 = 1.0;
+            for (int i = 0; i < c; ++i)
+                b2 *= (double)(l - t + 1 - i) / (i + 1);
+
+            // (N-t-c)_f
+            double ff = 1.0;
+            for (int i = 0; i < f; ++i)
+                ff *= (double)(N - t - c - i);
+
+            // C(c+f, c)
+            double b3 = 1.0;
+            for (int i = 0; i < c; ++i)
+                b3 *= (double)(c + f - i) / (i + 1);
+
+            // c!
+            double cf = 1.0;
+            for (int i = 2; i <= c; ++i) cf *= i;
+
+            // 2^c / 2
+            double twoc = std::pow(2.0, c) / 2.0;
+
+            sum_c += b1 * b2 * ff * b3 * cf * twoc;
+        }
+
+        var += q_val * sum_c;
+    }
+
+    double res = n_l * var;
+    if (!std::isfinite(res)) return std::numeric_limits<double>::infinity();
+    return res;
+}
+
+// ============================================================
+// path-count Markov + Chebyshev bound over L = 3..12
+//
+//   X <= 1/L + (1 - 1/L)·\delta + T,  T = \Sigma_{l=2}^{L-1} a_l·P_l/M
+//   a_l = 1/l - 1/L,  τ = x - 1/L - (1 - 1/L)·\delta
+//   If \tau > 0:
+//     Markov  : p <= E[T] / \tau
+//     Chebyshev (level split):  p <= (\Sigma_l (a_l^2*Var_l)^{1/3})^3 / (M*D)^2
+//       with D = \tau - E[T].
+// ============================================================
+
+static double path_concentration_bound(int N, int E, double x, double delta,
+                                       int& L_out, double& ET_out, bool& ch_out)
+{
+    L_out = 0; ET_out = 0.0; ch_out = false;
+    long long Mll = (long long)N * (N - 1) / 2;
+    if (Mll <= 0) return 1.0;
+    double M = (double)Mll;
+
+    double best_p = 1.0;
+
+    for (int L = 3; L <= 12 && L < N; ++L) {
+        double tau = x - 1.0 / L - (1.0 - 1.0 / L) * delta;
+        if (tau <= 0.0) continue;
+
+        // a_l, E[P_l], Var_l for l = 2..L-1
+        vector<double> a_vec, var_vec;
+        double ET = 0.0;
+        for (int l = 2; l < L; ++l) {
+            double a_l = 1.0 / l - 1.0 / L;
+            double EP_l = expected_paths(N, E, l);
+            ET += a_l * EP_l / M;
+            a_vec.push_back(a_l);
+            var_vec.push_back(path_variance_bound(N, E, l));
+        }
+
+        // Markov on T
+        double p_markov = std::min(1.0, ET / tau);
+        if (p_markov < best_p) {
+            best_p = p_markov;
+            L_out = L; ET_out = ET; ch_out = false;
+        }
+
+        // Chebyshev with optimal level splitting
+        double D = tau - ET;
+        if (D > 0.0) {
+            double sum_cube = 0.0;
+            bool ok = true;
+            for (size_t i = 0; i < a_vec.size(); ++i) {
+                double term = a_vec[i] * a_vec[i] * var_vec[i];
+                if (!std::isfinite(term) || term < 0.0) { ok = false; break; }
+                sum_cube += std::cbrt(term);
+            }
+            if (ok && sum_cube > 0.0) {
+                double denom = M * D;
+                double p_cheb = std::pow(sum_cube, 3.0) / (denom * denom);
+                p_cheb = std::min(1.0, p_cheb);
+                if (p_cheb < best_p) {
+                    best_p = p_cheb;
+                    L_out = L; ET_out = ET; ch_out = true;
+                }
+            }
+        }
+    }
+    return best_p;
 }
 
 // ============================================================
@@ -342,7 +497,8 @@ BoundResult bound_closeness_p(int N, int E, double x,
                       "x <= deterministic edge contribution delta");
     if (x > dmax) {
         if (x <= dmax + 1e-12) x = dmax;
-        else return finish(0.0, dmax, 1.0, 0.0, "deterministic_max", "x > deterministic maximum");
+        else return finish(0.0, dmax, 1.0, 0.0, "deterministic_max",
+                           "x > deterministic maximum");
     }
     if (c <= 0.0)
         return finish(x > delta ? 0.0 : 1.0, delta, 0.0, 0.0,
@@ -362,7 +518,6 @@ BoundResult bound_closeness_p(int N, int E, double x,
         return finish(z > 0.0 ? 0.0 : 1.0, delta, 0.0, 0.0,
                       "no_nonedge_capacity", "max_alpha <= 0");
 
-    // moments m_r = 2^r * S_r / max_alpha
     r.moments_Z.assign(max_order + 1, 0.0);
     for (int s : orders) {
         double v = pow(2.0, s) * S[s] / max_alpha;
@@ -370,14 +525,12 @@ BoundResult bound_closeness_p(int N, int E, double x,
     }
     r.U_Z = r.moments_Z[1];
 
-    // Paley-Zygmund lower bound on E[Z]
     double LY  = lower_nonedge_Y(N, E);
     double L_Z = (c > 0.0) ? LY / c : 0.0;
     L_Z = max(0.0, min(L_Z, r.U_Z));
     L_Z = min(L_Z, 1.0);
     r.L_Z = L_Z;
 
-    // Markov moment bounds
     for (int s : orders) {
         double m_s = r.moments_Z[s];
         double p   = min(1.0, m_s / pow(z, s));
@@ -386,7 +539,6 @@ BoundResult bound_closeness_p(int N, int E, double x,
         r.bounds.push_back({"moment_markov", s, p, m_s, true, note});
     }
 
-    // Cantelli
     if (z > r.U_Z) {
         double m2 = r.moments_Z[2];
         double V  = max(0.0, m2 - L_Z * L_Z);
@@ -404,6 +556,19 @@ BoundResult bound_closeness_p(int N, int E, double x,
         r.bounds.push_back({"cantelli_range", 0, 1.0, 0.0, false, "not applicable: z <= U_Z"});
     }
 
+    // ---------- path-count Markov + Chebyshev ----------
+    {
+        int Lb; double ET_p; bool ch;
+        double p = path_concentration_bound(N, E, x, delta, Lb, ET_p, ch);
+        if (Lb > 0) {
+            char note[128];
+            snprintf(note, sizeof(note),
+                     "path counts, L=%d, %s", Lb, ch ? "Chebyshev" : "Markov");
+            r.bounds.push_back({"path_chebyshev", Lb, p, ET_p, true, note});
+        }
+    }
+    // -------------------------------------------------------
+
     r.U_X = delta + c * r.U_Z;
     add_best(r);
     return r;
@@ -414,25 +579,26 @@ BoundResult bound_closeness_p(int N, int E, double x,
 // ============================================================
 
 int main(int argc, char* argv[]) {
-    string data_dir   = "data";
+    string data_dir    = "data";
     string x_file;
-    string orders_str = "1,2,3,4";
-    string out_file   = "bounds_summary.csv";
-    string detail_file= "bounds_detail.csv";
-    int    nthreads   = 16;
+    string save_x_file = "observed_closeness.csv";
+    string orders_str  = "1,2,3,4";
+    string out_file    = "results/bounds_summary.csv";
+    string detail_file = "results/bounds_detail.csv";
+    int    nthreads    = 16;
 
     for (int i = 1; i < argc; ++i) {
         string a = argv[i];
         auto next = [&]() -> string { return (i + 1 < argc) ? argv[++i] : string(); };
         if      (a == "--data")    data_dir    = next();
         else if (a == "--x-file")  x_file      = next();
+        else if (a == "--save-x")  save_x_file = next();
         else if (a == "--orders")  orders_str  = next();
         else if (a == "--out")     out_file    = next();
         else if (a == "--detail")  detail_file = next();
         else if (a == "--threads") nthreads    = max(1, stoi(next()));
     }
 
-    // parse orders
     vector<int> orders;
     {
         istringstream iss(orders_str);
@@ -448,42 +614,64 @@ int main(int argc, char* argv[]) {
     }
     int max_order = *max_element(orders.begin(), orders.end());
 
-    // optional precomputed x
+    // load x values (save-x first, --x-file overrides)
     unordered_map<string,double> xs;
-    if (!x_file.empty()) {
-        ifstream xf(x_file);
-        vector<string> lines;
-        string L;
-        while (getline(xf, L)) lines.push_back(L);
-        if (!lines.empty()) {
-            if (lines[0].find("closeness") != string::npos) {
-                // header-aware
-                vector<string> cols;
-                { istringstream hs(lines[0]); string t; while (getline(hs, t, ',')) cols.push_back(t); }
-                int lc = -1, cc = -1;
-                for (size_t j = 0; j < cols.size(); ++j) {
-                    if (cols[j] == "language")  lc = (int)j;
-                    if (cols[j] == "closeness") cc = (int)j;
-                }
-                if (lc >= 0 && cc >= 0) {
-                    for (size_t i = 1; i < lines.size(); ++i) {
-                        vector<string> r;
-                        { istringstream rs(lines[i]); string t; while (getline(rs, t, ',')) r.push_back(t); }
-                        if ((int)r.size() > max(lc, cc)) {
-                            try { xs[r[lc]] = stod(r[cc]); } catch (...) {}
-                        }
+
+    auto load_x_csv = [&](const string& path, bool allow_header) {
+        if (path.empty()) return;
+        ifstream f(path);
+        if (!f.is_open()) return;
+        string line;
+        if (!getline(f, line) || line.empty()) return;
+        vector<string> r;
+        {
+            istringstream rs(line); string t;
+            while (getline(rs, t, ',')) r.push_back(t);
+        }
+        if (allow_header) {
+            int lc = -1, cc = -1;
+            for (size_t j = 0; j < r.size(); ++j) {
+                if (r[j] == "language")  lc = (int)j;
+                if (r[j] == "closeness") cc = (int)j;
+            }
+            if (lc >= 0 && cc >= 0) {
+                while (getline(f, line)) {
+                    if (line.empty()) continue;
+                    vector<string> r2;
+                    istringstream rs2(line); string t2;
+                    while (getline(rs2, t2, ',')) r2.push_back(t2);
+                    if ((int)r2.size() > max(lc, cc)) {
+                        try { xs[r2[lc]] = stod(r2[cc]); } catch (...) {}
                     }
                 }
-            } else {
-                // simple language,closeness
-                for (auto& line : lines) {
-                    vector<string> r;
-                    { istringstream rs(line); string t; while (getline(rs, t, ',')) r.push_back(t); }
-                    if (r.size() >= 2) { try { xs[r[0]] = stod(r[1]); } catch (...) {} }
-                }
+                return;
             }
         }
-    }
+        if (r.size() >= 2) { try { xs[r[0]] = stod(r[1]); } catch (...) {} }
+        while (getline(f, line)) {
+            if (line.empty()) continue;
+            vector<string> r2;
+            istringstream rs2(line); string t2;
+            while (getline(rs2, t2, ',')) r2.push_back(t2);
+            if (r2.size() >= 2) { try { xs[r2[0]] = stod(r2[1]); } catch (...) {} }
+        }
+    };
+
+    load_x_csv(save_x_file, false);
+    if (!x_file.empty()) load_x_csv(x_file, true);
+
+    auto write_save_x = [&]() {
+        if (save_x_file.empty()) return;
+        auto par = fs::path(save_x_file).parent_path();
+        if (!par.empty()) fs::create_directories(par);
+        ofstream out(save_x_file);
+        out << "language,closeness\n";
+        out << setprecision(17);
+        vector<string> keys;
+        for (auto& kv : xs) keys.push_back(kv.first);
+        sort(keys.begin(), keys.end());
+        for (auto& k : keys) out << k << ',' << xs[k] << '\n';
+    };
 
     auto make_parent = [](const string& p) {
         auto par = fs::path(p).parent_path();
@@ -515,10 +703,15 @@ int main(int argc, char* argv[]) {
         int N = g.N, E = (int)g.edges.size();
 
         double x;
-        if (xs.count(lang)) x = xs[lang];
-        else {
-            int eff = (N < 500) ? 1 : nthreads;     // small graphs: OpenMP overhead dominates
+        bool computed_here = false;
+        auto it = xs.find(lang);
+        if (it != xs.end()) {
+            x = it->second;
+        } else {
+            int eff = (N < 500) ? 1 : nthreads;
             x = observed_closeness(g, eff);
+            xs[lang] = x;
+            computed_here = true;
         }
         if (!isfinite(x)) x = 0.0;
 
@@ -548,9 +741,13 @@ int main(int argc, char* argv[]) {
         }
         fsum.flush(); fdet.flush();
 
+        if (computed_here) write_save_x();
+
         printf("%-14s%8d%9d%8.3f%10.3e%10.6f%10.6f%12.4e%10.6f%12.4e%10.6f\n",
                lang.c_str(), N, E, mean_k, delta, x, U_old, p_old, r.U_X, r.best, dmax);
         fflush(stdout);
     }
+
+    write_save_x();
     return 0;
 }
