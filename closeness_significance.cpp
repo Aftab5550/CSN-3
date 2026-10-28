@@ -452,6 +452,7 @@ int main(int argc, char* argv[]) {
     int Q = (argc > 2) ? stoi(argv[2]) : 10;
     double sample_ratio = (argc > 3) ? stod(argv[3]) : 0.05;
     string single_lang = (argc > 4) ? argv[4] : "ALL";
+    string out_path    = (argc > 5) ? argv[5] : "results/table_2_significance.csv";
 
     vector<string> languages = {
         "Hungarian", "Greek", "Basque", "Arabic", "Catalan", "Chinese",
@@ -461,7 +462,7 @@ int main(int argc, char* argv[]) {
         languages = {single_lang};
     }
 
-    ofstream out_csv("results/table_2_significance.csv");
+    ofstream out_csv(out_path);
     out_csv << "language,N,E,M_sampled,sample_ratio,closeness,p_binomial,p_switching,time_sec\n";
 
     cout << left << setw(12) << "Language"
