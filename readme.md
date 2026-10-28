@@ -2,12 +2,13 @@
 
 Lab session: *Significance of network metrics* — **closeness group**.
 
-Two independent C++ binaries:
+Two independent C++ binaries and one R preprocessing script:
 
-| Binary | What it does | Output |
+| Component | What it does | Output |
 |---|---|---|
+| `data_preparation.R` | Parses UD 2.18 CoNLL-U treebanks, strips punctuation/loops/multiedges, exports undirected edge lists and Table 1 | `data/*_dependency_network.txt`, `results/table_1_summary.csv` |
 | `closeness_significance` | Monte Carlo p-values for mean closeness under (a) Erdős–Rényi `G(N,E)` and (b) the degree-preserving switching model | user-supplied path (default `results/table_2_significance.csv`) |
-| `bounds` | Rigorous **analytical upper bounds** on `p(C_NH >= C_obs)` under `G(N,E)` only — Markov, higher-moment Markov, Cantelli, path-count Markov, path-count Chebyshev | `bounds_summary.csv`, `bounds_detail.csv`, `observed_closeness.csv` |
+| `bounds` | Rigorous **analytical upper bounds** on `p(C_NH >= C_obs)` under `G(N,E)` only — Markov, higher-moment Markov, Cantelli, path-count Markov, path-count Chebyshev | `results/bounds_summary.csv`, `results/bounds_detail.csv`, `observed_closeness.csv` |
 
 The MC pipeline answers *"is the metric significantly large?"*. The analytical pipeline gives an independent, rigorous confirmation that does not rely on sampling — useful as a cross-check and as an Advanced-exercise result.
 
@@ -18,6 +19,7 @@ The MC pipeline answers *"is the metric significantly large?"*. The analytical p
 ```
 .
 ├── README.md
+├── data_preparation.R             # R script to build networks and Table 1
 ├── closeness_significance.cpp     # MC p-values (ER + switching)
 ├── bounds.cpp                     # analytical bounds (ER only)
 │
@@ -35,14 +37,14 @@ The MC pipeline answers *"is the metric significantly large?"*. The analytical p
 │   ├── Spanish_dependency_network.txt
 │   └── Turkish_dependency_network.txt
 │
-├── results/                       # MUST exist before running closeness_significance
-│   ├── table_2_significance.csv   # default output of the full MC run
-│   ├── hungarian_T100_Q30.csv     # per-language runs, if any
-│   ├── basque_T100_Q30.csv
-│   └── ...
+├── results/                       # MUST exist before running binaries
+│   ├── table_1_summary.csv        # elementary network properties (Table 1)
+│   ├── table_2_significance.csv   # default output of the full MC run (Table 2)
+│   ├── hungarian_T100_Q30.csv     # high-resolution per-language MC run
+│   ├── basque_T100_Q30.csv        # high-resolution per-language MC run
+│   ├── bounds_summary.csv         # produced by `bounds` (one row per language)
+│   └── bounds_detail.csv          # produced by `bounds` (one row per bound tried)
 │
-├── bounds_summary.csv             # produced by `bounds` (one row per language)
-├── bounds_detail.csv              # produced by `bounds` (one row per bound tried)
 └── observed_closeness.csv         # produced by `bounds`; reusable as --x-file
 ```
 
@@ -69,7 +71,7 @@ word1 word3
 
 - A C++17 compiler (`g++ >= 7`, `clang++ >= 6`, or MSVC 2017+).
 - **OpenMP** for multithreading (GCC's `libgomp`, Clang's `libomp`).
-- Nothing else — no external libraries, no Python, no R.
+- Nothing else is required to compile and run the C++ binaries (R with `igraph` and `udpipe` is only used once by `data_preparation.R` to extract `data/*.txt` from raw UD treebanks).
 
 ---
 
@@ -94,7 +96,7 @@ Notes:
 **Pre-flight:**
 
 ```bash
-mkdir -p results          # required by closeness_significance (it does not create the folder itself)
+mkdir -p results          # required by closeness_significance
 ls data/*.txt | wc -l     # should print 12
 ```
 
@@ -150,8 +152,8 @@ bounds  [--data DIR]  [--x-file CSV]  [--save-x CSV]
 | `--x-file` | — | CSV with `language` + `closeness` columns; **skips all BFS** |
 | `--save-x` | `observed_closeness.csv` | where to cache computed closeness values |
 | `--orders` | `1,2,3,4` | moment orders for the Markov bounds (order 1 always added) |
-| `--out` | `bounds_summary.csv` | one row per language |
-| `--detail` | `bounds_detail.csv` | one row per (language, bound) tried |
+| `--out` | `results/bounds_summary.csv` | one row per language |
+| `--detail` | `results/bounds_detail.csv` | one row per (language, bound) tried |
 | `--threads` | 16 | OpenMP threads for the fallback BFS |
 
 **Preferred workflow** — reuse the MC pipeline's `closeness` column:
@@ -160,7 +162,7 @@ bounds  [--data DIR]  [--x-file CSV]  [--save-x CSV]
 ./bounds --data data --x-file results/table_2_significance.csv
 ```
 
-Runs in milliseconds per language. `bounds_detail.csv` shows which bound won (typically `path_chebyshev` with `L = 3` or `4`).
+Runs in milliseconds per language. `results/bounds_detail.csv` shows which bound won (typically `path_chebyshev` with `L = 3` or `4`).
 
 **Cold workflow** — no `--x-file`; BFS over all vertices with 16 threads:
 
@@ -172,13 +174,13 @@ Writes `observed_closeness.csv` after *every* language, so an interrupted run re
 
 **CSV columns.**
 
-`bounds_summary.csv`:
+`results/bounds_summary.csv`:
 
 ```
 language,N,E,mean_k,delta,x_obs,U_old,p_old_markov,U_new,p_new_best,deterministic_max
 ```
 
-`bounds_detail.csv`:
+`results/bounds_detail.csv`:
 
 ```
 language,N,E,x_obs,bound,order,p_bound,value,note
@@ -186,6 +188,3 @@ language,N,E,x_obs,bound,order,p_bound,value,note
 
 The `bound` column contains one row per bound tried:
 `old_markov`, `moment_markov` (one per requested order), `cantelli_m2`, `cantelli_range`, `path_chebyshev`, and `best`.
-
-
-
